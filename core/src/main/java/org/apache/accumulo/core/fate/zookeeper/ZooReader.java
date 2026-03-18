@@ -20,49 +20,48 @@ package org.apache.accumulo.core.fate.zookeeper;
 
 import static java.util.Objects.requireNonNull;
 
-import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 
 import org.apache.accumulo.core.clientImpl.AcceptableThriftTableOperationException;
-import org.apache.accumulo.core.util.Retry;
 import org.apache.accumulo.core.util.Retry.RetryFactory;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.KeeperException.Code;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.data.Stat;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 public class ZooReader {
-  private static final Logger log = LoggerFactory.getLogger(ZooReader.class);
 
-  protected static final RetryFactory RETRY_FACTORY =
-      Retry.builder().maxRetries(10).retryAfter(Duration.ofMillis(250))
-          .incrementBy(Duration.ofMillis(250)).maxWait(Duration.ofMinutes(2)).backOffFactor(1.5)
-          .logInterval(Duration.ofMinutes(3)).createFactory();
-
-  protected final String connectString;
-  protected final int timeout;
+  protected final ZooConnectionInfo connectionInfo;
+  protected final ZooRetrier retrier;
 
   public ZooReader(String connectString, int timeout) {
-    this.connectString = requireNonNull(connectString);
-    this.timeout = timeout;
+    this(new ZooConnectionInfo(connectString, timeout));
+  }
+
+  public ZooReader(ZooConnectionInfo connectionInfo) {
+    this(connectionInfo, new ZooRetrier());
+  }
+
+  public ZooReader(ZooConnectionInfo connectionInfo, ZooRetrier retrier) {
+    this.connectionInfo = requireNonNull(connectionInfo);
+    this.retrier = requireNonNull(retrier);
   }
 
   public ZooReaderWriter asWriter(String secret) {
-    return new ZooReaderWriter(connectString, timeout, secret);
+    return new ZooReaderWriter(connectionInfo, retrier, secret);
   }
 
   protected ZooKeeper getZooKeeper() {
-    return ZooSession.getAnonymousSession(connectString, timeout);
+    return ZooSession.getAnonymousSession(connectionInfo.getConnectString(),
+        connectionInfo.getTimeout());
   }
 
   protected RetryFactory getRetryFactory() {
-    return RETRY_FACTORY;
+    return retrier.getRetryFactory();
   }
 
   /**
@@ -72,7 +71,7 @@ public class ZooReader {
    * @return the timeout in milliseconds
    */
   public int getSessionTimeout() {
-    return timeout;
+    return connectionInfo.getTimeout();
   }
 
   public byte[] getData(String zPath) throws KeeperException, InterruptedException {
@@ -134,14 +133,9 @@ public class ZooReader {
     }
   }
 
-  protected interface ZKFunction<R> {
-    R apply(ZooKeeper zk) throws KeeperException, InterruptedException;
-  }
+  protected interface ZKFunction<R> extends ZooRetrier.ZooKeeperAction<R> {}
 
-  protected interface ZKFunctionMutator<R> {
-    R apply(ZooKeeper zk)
-        throws KeeperException, InterruptedException, AcceptableThriftTableOperationException;
-  }
+  protected interface ZKFunctionMutator<R> extends ZooRetrier.ZooKeeperMutatorAction<R> {}
 
   /**
    * This method executes the provided function, retrying several times for transient issues.
@@ -157,14 +151,7 @@ public class ZooReader {
    */
   protected <R> R retryLoop(ZKFunction<R> zkf, Predicate<KeeperException> alwaysRetryCondition)
       throws KeeperException, InterruptedException {
-    try {
-      // reuse the code from retryLoopMutator, but suppress the exception
-      // because ZKFunction can't throw it
-      return retryLoopMutator(zkf::apply, alwaysRetryCondition);
-    } catch (AcceptableThriftTableOperationException e) {
-      throw new AssertionError("Not possible; " + ZKFunction.class.getName() + " can't throw "
-          + AcceptableThriftTableOperationException.class.getName());
-    }
+    return retrier.retryLoop(zkf, alwaysRetryCondition, this::getZooKeeper);
   }
 
   /**
@@ -176,43 +163,6 @@ public class ZooReader {
   protected <R> R retryLoopMutator(ZKFunctionMutator<R> zkf,
       Predicate<KeeperException> alwaysRetryCondition)
       throws KeeperException, InterruptedException, AcceptableThriftTableOperationException {
-    requireNonNull(zkf);
-    requireNonNull(alwaysRetryCondition);
-    var retries = getRetryFactory().createRetry();
-    while (true) {
-      try {
-        return zkf.apply(getZooKeeper());
-      } catch (KeeperException e) {
-        if (alwaysRetryCondition.test(e)) {
-          retries.waitForNextAttempt(log,
-              "attempting to communicate with zookeeper after exception that always requires retry: "
-                  + e.getMessage());
-          continue;
-        } else if (useRetryForTransient(retries, e)) {
-          continue;
-        }
-        throw e;
-      }
-    }
-  }
-
-  // should use an available retry if there are retries left and
-  // the issue is one that is likely to be transient
-  private static boolean useRetryForTransient(Retry retries, KeeperException e)
-      throws KeeperException, InterruptedException {
-    final Code c = e.code();
-    if (c == Code.CONNECTIONLOSS || c == Code.OPERATIONTIMEOUT || c == Code.SESSIONEXPIRED) {
-      log.warn("Saw (possibly) transient exception communicating with ZooKeeper", e);
-      if (retries.canRetry()) {
-        retries.useRetry();
-        retries.waitForNextAttempt(log,
-            "attempting to communicate with zookeeper after exception: " + e.getMessage());
-        return true;
-      }
-      log.error("Retry attempts ({}) exceeded trying to communicate with ZooKeeper",
-          retries.retriesCompleted());
-    }
-    // non-transient issue should always be thrown and handled by the caller
-    return false;
+    return retrier.retryLoopMutator(zkf, alwaysRetryCondition, this::getZooKeeper);
   }
 }
