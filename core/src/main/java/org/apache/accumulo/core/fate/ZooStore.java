@@ -34,16 +34,11 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
 
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeExistsPolicy;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeMissingPolicy;
-import org.apache.accumulo.core.util.CountDownTimer;
 import org.apache.accumulo.core.util.FastFormat;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.KeeperException.NoNodeException;
@@ -62,11 +57,7 @@ public class ZooStore<T> implements TStore<T> {
   private static final Logger log = LoggerFactory.getLogger(ZooStore.class);
   private String path;
   private ZooReaderWriter zk;
-  private String lastReserved = "";
-  private Set<Long> reserved;
-  private Map<Long,CountDownTimer> deferred;
-  private long statusChangeEvents = 0;
-  private int reservationsWaiting = 0;
+  private final FateReservation reservation = new FateReservation();
 
   private byte[] serialize(Object o) {
 
@@ -105,8 +96,6 @@ public class ZooStore<T> implements TStore<T> {
 
     this.path = path;
     this.zk = zk;
-    this.reserved = new HashSet<>();
-    this.deferred = new HashMap<>();
 
     zk.putPersistentData(path, new byte[0], NodeExistsPolicy.SKIP);
   }
@@ -135,106 +124,27 @@ public class ZooStore<T> implements TStore<T> {
 
   @Override
   public long reserve() {
-    try {
-      while (true) {
-
-        long events;
-        synchronized (this) {
-          events = statusChangeEvents;
-        }
-
-        List<String> txdirs = new ArrayList<>(zk.getChildren(path));
-        Collections.sort(txdirs);
-
-        synchronized (this) {
-          if (!txdirs.isEmpty() && txdirs.get(txdirs.size() - 1).compareTo(lastReserved) <= 0) {
-            lastReserved = "";
-          }
-        }
-
-        for (String txdir : txdirs) {
-          long tid = parseTid(txdir);
-
-          synchronized (this) {
-            // this check makes reserve pick up where it left off, so that it cycles through all as
-            // it is repeatedly called.... failing to do so can lead to
-            // starvation where fate ops that sort higher and hold a lock are never reserved.
-            if (txdir.compareTo(lastReserved) <= 0) {
-              continue;
-            }
-
-            if (deferred.containsKey(tid)) {
-              if (deferred.get(tid).isExpired()) {
-                deferred.remove(tid);
-              } else {
-                continue;
-              }
-            }
-            if (reserved.contains(tid)) {
-              continue;
-            } else {
-              reserved.add(tid);
-              lastReserved = txdir;
-            }
-          }
-
-          // have reserved id, status should not change
-
-          try {
-            TStatus status = TStatus.valueOf(new String(zk.getData(path + "/" + txdir), UTF_8));
-            if (status == TStatus.SUBMITTED || status == TStatus.IN_PROGRESS
-                || status == TStatus.FAILED_IN_PROGRESS) {
-              return tid;
-            } else {
-              unreserve(tid);
-            }
-          } catch (NoNodeException nne) {
-            // node deleted after we got the list of children, its ok
-            unreserve(tid);
-          } catch (KeeperException | InterruptedException | RuntimeException e) {
-            unreserve(tid);
-            throw e;
-          }
-        }
-
-        synchronized (this) {
-          // suppress lgtm alert - synchronized variable is not always true
-          if (events == statusChangeEvents) { // lgtm [java/constant-comparison]
-            if (deferred.isEmpty()) {
-              this.wait(5000);
-            } else {
-              long minWait = deferred.values().stream()
-                  .mapToLong(timer -> timer.timeLeft(MILLISECONDS)).min().orElseThrow();
-              if (minWait > 0) {
-                this.wait(Math.min(minWait, 5000));
-              }
-            }
-          }
-        }
+    return reservation.reserve(() -> {
+      try {
+        return zk.getChildren(path);
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException(e);
       }
-    } catch (KeeperException | InterruptedException e) {
-      throw new IllegalStateException(e);
-    }
+    }, this::parseTid, (tid) -> {
+      try {
+        return TStatus.valueOf(new String(zk.getData(getTXPath(tid)), UTF_8));
+      } catch (NoNodeException nne) {
+        // node deleted after we got the list of children, its ok
+        return TStatus.UNKNOWN;
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+    }, this::unreserve);
   }
 
   @Override
   public void reserve(long tid) {
-    synchronized (this) {
-      reservationsWaiting++;
-      try {
-        while (reserved.contains(tid)) {
-          try {
-            this.wait(1000);
-          } catch (InterruptedException e) {
-            throw new IllegalStateException(e);
-          }
-        }
-
-        reserved.add(tid);
-      } finally {
-        reservationsWaiting--;
-      }
-    }
+    reservation.reserve(tid);
   }
 
   /**
@@ -245,60 +155,20 @@ public class ZooStore<T> implements TStore<T> {
    */
   @Override
   public boolean tryReserve(long tid) {
-    synchronized (this) {
-      if (!reserved.contains(tid)) {
-        reserve(tid);
-        return true;
-      }
-      return false;
-    }
+    return reservation.tryReserve(tid);
   }
 
   private void unreserve(long tid) {
-    synchronized (this) {
-      if (!reserved.remove(tid)) {
-        throw new IllegalStateException(
-            "Tried to unreserve id that was not reserved " + FateTxId.formatTid(tid));
-      }
-
-      // do not want this unreserve to unesc wake up threads in reserve()... this leads to infinite
-      // loop when tx is stuck in NEW...
-      // only do this when something external has called reserve(tid)...
-      if (reservationsWaiting > 0) {
-        this.notifyAll();
-      }
-    }
+    reservation.unreserve(tid);
   }
 
   @Override
   public void unreserve(long tid, Duration deferTime) {
-
-    if (deferTime.isNegative()) {
-      throw new IllegalArgumentException("deferTime < 0 : " + deferTime);
-    }
-
-    synchronized (this) {
-      if (!reserved.remove(tid)) {
-        throw new IllegalStateException(
-            "Tried to unreserve id that was not reserved " + FateTxId.formatTid(tid));
-      }
-
-      if (deferTime.compareTo(Duration.ZERO) > 0) {
-        deferred.put(tid, CountDownTimer.startNew(deferTime));
-      }
-
-      this.notifyAll();
-    }
-
+    reservation.unreserve(tid, deferTime);
   }
 
   private void verifyReserved(long tid) {
-    synchronized (this) {
-      if (!reserved.contains(tid)) {
-        throw new IllegalStateException(
-            "Tried to operate on unreserved transaction " + FateTxId.formatTid(tid));
-      }
-    }
+    reservation.verifyReserved(tid);
   }
 
   private static final int RETRIES = 10;
@@ -408,28 +278,7 @@ public class ZooStore<T> implements TStore<T> {
 
   @Override
   public TStatus waitForStatusChange(long tid, EnumSet<TStatus> expected) {
-    while (true) {
-      long events;
-      synchronized (this) {
-        events = statusChangeEvents;
-      }
-
-      TStatus status = _getStatus(tid);
-      if (expected.contains(status)) {
-        return status;
-      }
-
-      synchronized (this) {
-        // suppress lgtm alert - synchronized variable is not always true
-        if (events == statusChangeEvents) { // lgtm [java/constant-comparison]
-          try {
-            this.wait(5000);
-          } catch (InterruptedException e) {
-            throw new IllegalStateException(e);
-          }
-        }
-      }
-    }
+    return reservation.waitForStatusChange(tid, expected, () -> _getStatus(tid));
   }
 
   @Override
@@ -443,10 +292,7 @@ public class ZooStore<T> implements TStore<T> {
       throw new IllegalStateException(e);
     }
 
-    synchronized (this) {
-      statusChangeEvents++;
-    }
-
+    reservation.notifyStatusChange();
   }
 
   @Override
