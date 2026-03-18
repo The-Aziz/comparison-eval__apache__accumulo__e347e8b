@@ -20,21 +20,15 @@ package org.apache.accumulo.manager.upgrade;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.accumulo.core.Constants.ZTABLE_STATE;
-import static org.apache.accumulo.manager.upgrade.Upgrader10to11.buildRepTablePath;
-import static org.easymock.EasyMock.createMock;
+import static org.apache.accumulo.manager.upgrade.ReplicationConfigUtil.buildRepTablePath;
 import static org.easymock.EasyMock.expect;
 import static org.easymock.EasyMock.expectLastCall;
-import static org.easymock.EasyMock.replay;
-import static org.easymock.EasyMock.verify;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import org.apache.accumulo.core.data.InstanceId;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
@@ -54,25 +48,19 @@ import org.slf4j.LoggerFactory;
 class Upgrader10to11Test {
   private static final Logger log = LoggerFactory.getLogger(Upgrader10to11Test.class);
 
-  private InstanceId instanceId = null;
-  private ServerContext context = null;
-  private ZooReaderWriter zrw = null;
-
-  private PropStore propStore = null;
+  private Upgrader10to11TestContext testContext;
 
   @BeforeEach
-  public void initMocks() {
-    instanceId = InstanceId.of(UUID.randomUUID());
-    context = createMock(ServerContext.class);
-    zrw = createMock(ZooReaderWriter.class);
-    propStore = createMock(PropStore.class);
-
-    expect(context.getZooReaderWriter()).andReturn(zrw).anyTimes();
-    expect(context.getInstanceID()).andReturn(instanceId).anyTimes();
+  public void init() {
+    testContext = new Upgrader10to11TestContext();
   }
 
   @Test
   void upgradeZooKeeperGoPath() throws Exception {
+    ServerContext context = testContext.getContext();
+    ZooReaderWriter zrw = testContext.getZooReaderWriter();
+    PropStore propStore = testContext.getPropStore();
+    InstanceId instanceId = testContext.getInstanceId();
 
     expect(context.getPropStore()).andReturn(propStore).anyTimes();
     expect(zrw.exists(buildRepTablePath(instanceId))).andReturn(true).once();
@@ -84,71 +72,61 @@ class Upgrader10to11Test {
     expect(propStore.get(TablePropKey.of(instanceId, AccumuloTable.METADATA.tableId())))
         .andReturn(new VersionedProperties()).once();
 
-    replay(context, zrw, propStore);
+    testContext.replayAll();
 
     Upgrader10to11 upgrader = new Upgrader10to11();
     upgrader.upgradeZookeeper(context);
 
-    verify(context, zrw);
+    testContext.verifyAll();
   }
 
   @Test
   void upgradeZookeeperNoReplTableNode() throws Exception {
+    ServerContext context = testContext.getContext();
+    ZooReaderWriter zrw = testContext.getZooReaderWriter();
+    InstanceId instanceId = testContext.getInstanceId();
 
     expect(zrw.exists(buildRepTablePath(instanceId))).andReturn(false).once();
-    replay(context, zrw);
+    testContext.replayAll();
 
     Upgrader10to11 upgrader = new Upgrader10to11();
     upgrader.upgradeZookeeper(context);
 
-    verify(context, zrw);
-  }
-
-  @Test
-  void checkReplicationStateOffline() throws Exception {
-
-    expect(context.getPropStore()).andReturn(propStore).anyTimes();
-    expect(zrw.exists(buildRepTablePath(instanceId))).andReturn(true).once();
-    expect(zrw.getData(buildRepTablePath(instanceId) + ZTABLE_STATE))
-        .andReturn(TableState.OFFLINE.name().getBytes(UTF_8)).once();
-    zrw.recursiveDelete(buildRepTablePath(instanceId), ZooUtil.NodeMissingPolicy.SKIP);
-    expectLastCall().once();
-    expect(propStore.get(TablePropKey.of(instanceId, AccumuloTable.METADATA.tableId())))
-        .andReturn(new VersionedProperties()).once();
-
-    replay(context, zrw, propStore);
-
-    Upgrader10to11 upgrader = new Upgrader10to11();
-
-    upgrader.upgradeZookeeper(context);
-
-    verify(context, zrw);
+    testContext.verifyAll();
   }
 
   @Test
   void checkReplicationStateOnline() throws Exception {
+    ServerContext context = testContext.getContext();
+    ZooReaderWriter zrw = testContext.getZooReaderWriter();
+    InstanceId instanceId = testContext.getInstanceId();
+
     expect(zrw.exists(buildRepTablePath(instanceId))).andReturn(true).once();
     expect(zrw.getData(buildRepTablePath(instanceId) + ZTABLE_STATE))
         .andReturn(TableState.ONLINE.name().getBytes(UTF_8)).anyTimes();
-    replay(context, zrw);
+    testContext.replayAll();
 
     Upgrader10to11 upgrader = new Upgrader10to11();
     assertThrows(IllegalStateException.class, () -> upgrader.upgradeZookeeper(context));
 
-    verify(context, zrw);
+    testContext.verifyAll();
   }
 
   @Test
   void checkReplicationStateNoNode() throws Exception {
+    ServerContext context = testContext.getContext();
+    ZooReaderWriter zrw = testContext.getZooReaderWriter();
+    InstanceId instanceId = testContext.getInstanceId();
+
     expect(zrw.exists(buildRepTablePath(instanceId))).andReturn(true).once();
     expect(zrw.getData(buildRepTablePath(instanceId) + ZTABLE_STATE))
         .andThrow(new KeeperException.NoNodeException("force no node exception")).anyTimes();
-    replay(context, zrw);
+    testContext.replayAll();
 
     Upgrader10to11 upgrader = new Upgrader10to11();
     assertThrows(IllegalStateException.class, () -> upgrader.upgradeZookeeper(context));
 
-    verify(context, zrw);
+    testContext.verifyAll();
   }
 
   @Test
@@ -177,14 +155,7 @@ class Upgrader10to11Test {
     entries.put("table.iterator.scan.vers",
         "10,org.apache.accumulo.core.iterators.user.VersioningIterator");
 
-    String REPL_ITERATOR_PATTERN = "^table\\.iterator\\.(majc|minc|scan)\\.replcombiner$";
-    String REPL_COLUMN_PATTERN =
-        "^table\\.iterator\\.(majc|minc|scan)\\.replcombiner\\.opt\\.columns$";
-
-    Pattern p = Pattern.compile("(" + REPL_ITERATOR_PATTERN + "|" + REPL_COLUMN_PATTERN + ")");
-
-    List<String> filtered =
-        entries.keySet().stream().filter(e -> p.matcher(e).find()).collect(Collectors.toList());
+    List<String> filtered = ReplicationConfigUtil.filterReplConfigKeys(entries.keySet());
 
     assertEquals(6, filtered.size());
     log.info("F:{}", filtered);
