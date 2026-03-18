@@ -19,7 +19,6 @@
 package org.apache.accumulo.manager.upgrade;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.apache.accumulo.core.Constants.ZTABLES;
 import static org.apache.accumulo.core.Constants.ZTABLE_STATE;
 import static org.apache.accumulo.core.metadata.schema.MetadataSchema.RESERVED_PREFIX;
 import static org.apache.accumulo.server.util.MetadataTableUtil.EMPTY_TEXT;
@@ -27,9 +26,6 @@ import static org.apache.accumulo.server.util.MetadataTableUtil.EMPTY_TEXT;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import org.apache.accumulo.core.client.BatchDeleter;
 import org.apache.accumulo.core.client.BatchWriter;
@@ -61,11 +57,8 @@ public class Upgrader10to11 implements Upgrader {
 
   private static final Logger log = LoggerFactory.getLogger(Upgrader10to11.class);
 
-  // Included for upgrade code usage any other usage post 3.0 should not be used.
-  private static final TableId REPLICATION_ID = TableId.of("+rep");
-
-  private static final Range REP_TABLE_RANGE =
-      new Range(REPLICATION_ID.canonical() + ";", true, REPLICATION_ID.canonical() + "<", true);
+  private static final Range REP_TABLE_RANGE = new Range(ReplicationConfigUtil.REPLICATION_ID.canonical() + ";",
+      true, ReplicationConfigUtil.REPLICATION_ID.canonical() + "<", true);
 
   // copied from MetadataSchema 2.1 (removed in 3.0)
   private static final Range REP_WAL_RANGE =
@@ -176,7 +169,7 @@ public class Upgrader10to11 implements Upgrader {
 
   private boolean checkReplicationTableInZk(final InstanceId iid, final ZooReaderWriter zrw) {
     try {
-      String path = buildRepTablePath(iid);
+      String path = ReplicationConfigUtil.buildRepTablePath(iid);
       return zrw.exists(path);
     } catch (KeeperException ex) {
       throw new IllegalStateException("ZooKeeper error - cannot determine replication table status",
@@ -196,7 +189,7 @@ public class Upgrader10to11 implements Upgrader {
    */
   private boolean checkReplicationOffline(final InstanceId iid, final ZooReaderWriter zrw) {
     try {
-      String path = buildRepTablePath(iid) + ZTABLE_STATE;
+      String path = ReplicationConfigUtil.buildRepTablePath(iid) + ZTABLE_STATE;
       byte[] bytes = zrw.getData(path);
       if (bytes != null && bytes.length > 0) {
         String status = new String(bytes, UTF_8);
@@ -212,16 +205,8 @@ public class Upgrader10to11 implements Upgrader {
     }
   }
 
-  /**
-   * Utility method to build the ZooKeeper replication table path. The path resolves to
-   * {@code /accumulo/INSTANCE_ID/tables/+rep}
-   */
-  static String buildRepTablePath(final InstanceId iid) {
-    return ZooUtil.getRoot(iid) + ZTABLES + "/" + REPLICATION_ID.canonical();
-  }
-
   private void deleteReplicationTableZkEntries(ZooReaderWriter zrw, InstanceId iid) {
-    String repTablePath = buildRepTablePath(iid);
+    String repTablePath = ReplicationConfigUtil.buildRepTablePath(iid);
     try {
       zrw.recursiveDelete(repTablePath, ZooUtil.NodeMissingPolicy.SKIP);
     } catch (KeeperException ex) {
@@ -238,7 +223,7 @@ public class Upgrader10to11 implements Upgrader {
     PropStoreKey<TableId> metaKey = TablePropKey.of(iid, AccumuloTable.METADATA.tableId());
     var p = propStore.get(metaKey);
     var props = p.asMap();
-    List<String> filtered = filterReplConfigKeys(props.keySet());
+    List<String> filtered = new ArrayList<>(ReplicationConfigUtil.filterReplConfigKeys(props.keySet()));
     // add replication status formatter to remove list.
     String v = props.get("table.formatter");
     if (v != null && v.compareTo("org.apache.accumulo.server.replication.StatusFormatter") == 0) {
@@ -249,21 +234,5 @@ public class Upgrader10to11 implements Upgrader {
       log.trace("Upgrade filtering replication iterators for id: {}", metaKey);
       propStore.removeProperties(metaKey, filtered);
     }
-  }
-
-  /**
-   * Return a list of property keys that match replication iterator settings. This is specifically a
-   * narrow filter to avoid potential matches with user define or properties that contain
-   * replication in the property name (specifically table.file.replication which set hdfs block
-   * replication.)
-   */
-  private List<String> filterReplConfigKeys(Set<String> keys) {
-    String REPL_ITERATOR_PATTERN = "^table\\.iterator\\.(majc|minc|scan)\\.replcombiner$";
-    String REPL_COLUMN_PATTERN =
-        "^table\\.iterator\\.(majc|minc|scan)\\.replcombiner\\.opt\\.columns$";
-
-    Pattern p = Pattern.compile("(" + REPL_ITERATOR_PATTERN + "|" + REPL_COLUMN_PATTERN + ")");
-
-    return keys.stream().filter(e -> p.matcher(e).find()).collect(Collectors.toList());
   }
 }
